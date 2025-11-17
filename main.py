@@ -1,11 +1,24 @@
 import os
 import math
 import random
-from datetime import datetime
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
-app = FastAPI(title="TOFY-X1 Backend", version="1.0.0")
+from fastapi import FastAPI, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+
+try:
+    # Database utilities (MongoDB)
+    from database import db, create_document, get_documents
+except Exception:
+    db = None
+    def create_document(*args, **kwargs):
+        raise Exception("Database not available")
+    def get_documents(*args, **kwargs):
+        raise Exception("Database not available")
+
+app = FastAPI(title="TOFY-X1 Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,15 +39,12 @@ def hello():
 # --- Simulation helpers ---
 _start = datetime.utcnow().timestamp()
 
-
 def _sim_value(base: float, amp: float, speed: float, noise: float = 0.5) -> float:
     t = datetime.utcnow().timestamp() - _start
     return base + amp * math.sin(t * speed) + random.uniform(-noise, noise)
 
 
-@app.get("/api/telemetry")
-def telemetry():
-    """Return simulated real-time telemetry for the rover."""
+def _make_telemetry_payload() -> Dict[str, Any]:
     # Environmental
     ambient_temp = round(_sim_value(22.0, 6.0, 0.06), 2)  # C
     surface_temp = round(ambient_temp + _sim_value(5.0, 3.0, 0.08, 0.3), 2)
@@ -59,7 +69,6 @@ def telemetry():
     sun_dir = (datetime.utcnow().timestamp() * 6) % 360
 
     # Camouflage color based on environment (blue=cool, red=hot)
-    # Map surface_temp 10C..60C to hue 220..0
     hue = max(0, min(220, int(220 - (surface_temp - 10) * (220 / 50))))
     camo_color_hsl = f"hsl({hue}, 70%, 55%)"
 
@@ -105,10 +114,184 @@ def telemetry():
     }
 
 
+def _active_session() -> Optional[dict]:
+    if not db:
+        return None
+    try:
+        return db["session"].find_one({"active": True})
+    except Exception:
+        return None
+
+
+@app.get("/api/telemetry")
+def telemetry():
+    """Return simulated real-time telemetry for the rover and optionally persist when a session is active."""
+    payload = _make_telemetry_payload()
+
+    # Auto-attach image url for convenience
+    payload["image"] = {
+        "url": "https://images.unsplash.com/photo-1462331940025-496dfbfc7564?q=80&w=1600&auto=format&fit=crop"
+    }
+
+    # If a recording session is active, persist this snapshot
+    sess = _active_session()
+    if sess:
+        try:
+            create_document("telemetry", payload)
+        except Exception:
+            pass
+
+    return payload
+
+
+@app.post("/api/session/start")
+def start_session():
+    """Start a recording session so that subsequent telemetry calls are stored."""
+    if not db:
+        return JSONResponse({"status": "error", "message": "Database not configured"}, status_code=400)
+
+    # Deactivate previous sessions
+    db["session"].update_many({"active": True}, {"$set": {"active": False, "ended_at": datetime.utcnow()}})
+    sess = {
+        "active": True,
+        "started_at": datetime.utcnow(),
+        "note": "TOFY-X1 recording session"
+    }
+    db["session"].insert_one(sess)
+    return {"status": "ok", "active": True}
+
+
+@app.post("/api/session/stop")
+def stop_session():
+    if not db:
+        return JSONResponse({"status": "error", "message": "Database not configured"}, status_code=400)
+    db["session"].update_many({"active": True}, {"$set": {"active": False, "ended_at": datetime.utcnow()}})
+    return {"status": "ok", "active": False}
+
+
+@app.get("/api/telemetry/history")
+def telemetry_history(
+    limit: int = Query(300, ge=1, le=5000),
+    minutes: Optional[int] = Query(None, ge=1, le=1440),
+):
+    """Return recent telemetry documents, optionally limited to last N minutes."""
+    if not db:
+        return JSONResponse({"status": "error", "message": "Database not configured"}, status_code=400)
+
+    q: Dict[str, Any] = {}
+    if minutes is not None:
+        since = datetime.utcnow() - timedelta(minutes=minutes)
+        q = {"created_at": {"$gte": since}}
+
+    docs = list(db["telemetry"].find(q).sort("created_at", -1).limit(limit))
+    for d in docs:
+        d["_id"] = str(d["_id"])  # make JSON serializable
+        if "created_at" in d:
+            d["created_at"] = d["created_at"].isoformat()
+        if "updated_at" in d:
+            d["updated_at"] = d["updated_at"].isoformat()
+    return {"items": list(reversed(docs))}
+
+
+@app.get("/api/export/csv")
+def export_csv(
+    minutes: Optional[int] = Query(None, ge=1, le=1440),
+    limit: int = Query(2000, ge=10, le=20000),
+):
+    """Export telemetry history as CSV."""
+    if not db:
+        return JSONResponse({"status": "error", "message": "Database not configured"}, status_code=400)
+
+    q: Dict[str, Any] = {}
+    if minutes is not None:
+        since = datetime.utcnow() - timedelta(minutes=minutes)
+        q = {"created_at": {"$gte": since}}
+
+    docs = list(db["telemetry"].find(q).sort("created_at", -1).limit(limit))
+
+    # CSV header
+    headers = [
+        "timestamp",
+        "ambient_temp_c","surface_temp_c","uv_index","ir_mw_m2","light_lux",
+        "battery_pct","battery_voltage",
+        "pitch","roll","yaw",
+        "lat","lon","speed_mps","heading",
+        "target_azimuth","panel_azimuth",
+        "camo_color_hsl",
+        "danger_level",
+        "created_at"
+    ]
+
+    def row(d: Dict[str, Any]) -> List[str]:
+        env = d.get("environment", {})
+        powr = d.get("power", {})
+        att = d.get("attitude", {})
+        nav = d.get("navigation", {})
+        sol = d.get("solar", {})
+        cam = d.get("camouflage", {})
+        return [
+            d.get("timestamp", ""),
+            str(env.get("ambient_temp_c", "")), str(env.get("surface_temp_c", "")), str(env.get("uv_index", "")), str(env.get("ir_mw_m2", "")), str(env.get("light_lux", "")),
+            str(powr.get("battery_pct", "")), str(powr.get("battery_voltage", "")),
+            str(att.get("pitch", "")), str(att.get("roll", "")), str(att.get("yaw", "")),
+            str(nav.get("lat", "")), str(nav.get("lon", "")), str(nav.get("speed_mps", "")), str(nav.get("heading", "")),
+            str(sol.get("target_azimuth", "")), str(sol.get("panel_azimuth", "")),
+            cam.get("color_hsl", ""),
+            d.get("danger_level", ""),
+            d.get("created_at").isoformat() if isinstance(d.get("created_at"), datetime) else str(d.get("created_at", "")),
+        ]
+
+    def generate():
+        yield ",".join(headers) + "\n"
+        for d in reversed(docs):
+            yield ",".join(row(d)) + "\n"
+
+    return StreamingResponse(generate(), media_type="text/csv", headers={
+        "Content-Disposition": "attachment; filename=tofy_telemetry.csv"
+    })
+
+
+@app.get("/api/metrics/summary")
+def metrics_summary(minutes: int = Query(60, ge=1, le=1440)):
+    """Compute min/max/avg for key metrics in a time window."""
+    if not db:
+        return JSONResponse({"status": "error", "message": "Database not configured"}, status_code=400)
+    since = datetime.utcnow() - timedelta(minutes=minutes)
+    q = {"created_at": {"$gte": since}}
+    docs = list(db["telemetry"].find(q))
+    if not docs:
+        return {"items": 0, "summary": {}}
+
+    def agg(path: List[str]):
+        vals = []
+        for d in docs:
+            cur = d
+            for p in path:
+                cur = cur.get(p, {}) if isinstance(cur, dict) else {}
+            try:
+                vals.append(float(cur))
+            except Exception:
+                pass
+        if not vals:
+            return {"min": None, "max": None, "avg": None}
+        return {"min": min(vals), "max": max(vals), "avg": sum(vals) / len(vals)}
+
+    return {
+        "items": len(docs),
+        "summary": {
+            "ambient_temp_c": agg(["environment", "ambient_temp_c"]),
+            "surface_temp_c": agg(["environment", "surface_temp_c"]),
+            "uv_index": agg(["environment", "uv_index"]),
+            "light_lux": agg(["environment", "light_lux"]),
+            "battery_pct": agg(["power", "battery_pct"]),
+            "speed_mps": agg(["navigation", "speed_mps"]),
+        },
+    }
+
+
 @app.get("/api/image")
 def image():
     """Provide a sample camera frame (static placeholder)."""
-    # Using a royalty-free placeholder image
     return {
         "url": "https://images.unsplash.com/photo-1462331940025-496dfbfc7564?q=80&w=1600&auto=format&fit=crop"
     }
@@ -116,7 +299,6 @@ def image():
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -125,36 +307,24 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+            response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
 
 

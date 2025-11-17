@@ -38,6 +38,47 @@ class Product(BaseModel):
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
+# Telemetry schema for persisted rover data
+class TelemetryEnvironment(BaseModel):
+    ambient_temp_c: float
+    surface_temp_c: float
+    uv_index: float
+    ir_mw_m2: float
+    light_lux: float
+
+class TelemetryPower(BaseModel):
+    battery_pct: float
+    battery_voltage: float
+
+class TelemetryAttitude(BaseModel):
+    pitch: float
+    roll: float
+    yaw: float
+
+class TelemetryNavigation(BaseModel):
+    lat: float
+    lon: float
+    speed_mps: float
+    heading: float
+
+class TelemetrySolar(BaseModel):
+    target_azimuth: float
+    panel_azimuth: float
+    light_lux: float
+
+class TelemetryCamouflage(BaseModel):
+    color_hsl: str
+
+class Telemetry(BaseModel):
+    timestamp: str
+    environment: TelemetryEnvironment
+    power: TelemetryPower
+    attitude: TelemetryAttitude
+    navigation: TelemetryNavigation
+    solar: TelemetrySolar
+    camouflage: TelemetryCamouflage
+    danger_level: str
+
 # Add your own schemas here:
 # --------------------------------------------------
 
